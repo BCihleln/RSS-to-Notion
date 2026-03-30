@@ -9,47 +9,91 @@ from dateutil import parser
 import time
 
 now = datetime.now(timezone.utc)
-load_time = 60  # 导入60天内的内容
+load_time = 1  # 导入1天内的文章
+max_post_count = 10 # 導入文章的最大數量
+
+
+def parse_publish_time(date_str):
+	"""
+	尝试多种格式解析发布时间
+	1. 先用 dateutil.parser.parse() 尝试
+	2. 如果失败，用正则表达式提取 JS 日期格式并用 strptime 解析
+	3. 如果都失败，返回当前时间
+	
+	Args:
+		date_str: 日期字符串
+	
+	Returns:
+		datetime 对象with UTC timezone
+	"""
+	if not date_str:
+		return now
+	
+	# 方法1: 尝试 dateutil.parser.parse()
+	try:
+		published_time = parser.parse(date_str)
+		return published_time
+	except (ValueError, TypeError, AttributeError):
+		pass
+	
+	# 方法2: 尝试用正则表达式提取 JS 日期格式
+	# 匹配格式如: "Fri Mar 27 2026 00:00:00" 或 "Fri Mar 27 2026 00:00:00 GMT+0000 ..."
+	js_date_pattern = r'(\w+\s+\w+\s+\d+\s+\d+\s+\d+:\d+:\d+)'
+	match = re.search(js_date_pattern, str(date_str))
+	if match:
+		try:
+			date_part = match.group(1)
+			published_time = datetime.strptime(date_part, "%a %b %d %Y %H:%M:%S")
+			# 添加 UTC 时区
+			published_time = published_time.replace(tzinfo=timezone.utc)
+			return published_time
+		except (ValueError, TypeError):
+			pass
+	
+	# 方法3: fallback 到当前时间
+	print(f"Warning: Failed to parse publish time '{date_str}', using current time")
+	return now
 
 
 def parse_rss_entries(url, retries=3):
+	feed = []
 	entries = []
-	feeds = []
+
+	# DEBUG
+	print(f"Processing : {url}")
+
 	for attempt in range(retries):
 		try:
-			res = requests.get(
+			response = requests.get(
 				url=url,
 				headers={"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.55 Safari/537.36 Edg/96.0.1054.34"},
 			)
 			error_code = 0
-		except requests.exceptions.ProxyError as e:
-			print(f"Load {url} Error, Attempt {attempt + 1} failed: {e}")
-			time.sleep(1)  # 等待1秒后重试
-			error_code = 1
-		except requests.exceptions.ConnectTimeout as e:
-			print(f"Load {url} Timeout, Attempt {attempt + 1} failed: {e}")
+		except (requests.exceptions.RequestException, Exception) as e:
+			print(f"Load {url} Error, Attempt {attempt + 1} failed: {type(e).__name__}: {e}")
 			time.sleep(1)  # 等待1秒后重试
 			error_code = 1
 
 		if error_code == 0:
-			parsed_feed = feedparser.parse(res.content)
-			soup = BeautifulSoup(res.content, 'xml')
+			parsed_feed = feedparser.parse(response.content)
+			soup = BeautifulSoup(response.content, 'xml')
 
 			## Update RSS Feed Status
 			feed_title = soup.find('title').text if soup.find('title') else 'No title available'
-			feeds = {
+			feed = {
 				"title": feed_title,
 				"link": url,
 				"status": "Active"
 			}
 
 			for entry in parsed_feed.entries:
-				if entry.get("published"):
-					published_time = parser.parse(entry.get("published"))
-				else:
-					published_time = datetime.now(timezone.utc)
+
+				# Get publish date
+				published_time = parse_publish_time(entry.get("published"))
 				if not published_time.tzinfo:
 					published_time = published_time.replace(tzinfo=timezone(timedelta(hours=8)))
+
+
 				if now - published_time < timedelta(days=load_time):
 					cover = BeautifulSoup(entry.get("summary"),'html.parser')
 					cover_list = cover.find_all('img')
@@ -66,22 +110,22 @@ def parse_rss_entries(url, retries=3):
 						}
 				)
 
-			return feeds, entries[:50]
-			# return feeds, entries[:3]	
+			return feed, entries[:max_post_count]
+			# return feed, entries[:3]
 		
-	feeds = {
+	feed = {
 		"title": "Unknown",
 		"link": url,
 		"status": "Error"
 	}
 
 		
-	return feeds, None
+	return feed, entries
 
 
 class NotionAPI:
 	NOTION_API_pages = "https://api.notion.com/v1/pages"
-	NOTION_API_database = "https://api.notion.com/v1/data_sources"
+	NOTION_API_database = "https://api.notion.com/v1/databases"
 
 
 	def __init__(self, secret, read, feed) -> None:
@@ -119,26 +163,23 @@ class NotionAPI:
 		# Grab requests
 		data = response.json()
 
-		# Dump the requested JSON file for test
+		# DEBUG: Dump the requested JSON file for test
 		# with open('db.json', 'w', encoding='utf8') as f:
 		# 	json.dump(data, f, ensure_ascii=False, indent=4)
 
 		rss_feed_list = []
 		for page in data['results']:
 			props = page["properties"]
-			multi_select = props["Tag"]["multi_select"]
-			name_color_pairs = [(item['name'], item['color']) for item in multi_select]
 			rss_feed_list.append(
 				{
 					"url": props["URL"]["url"],
-					"page_id": page.get("id"),
-					"tags": name_color_pairs
+					"page_id": page.get("id")
 				}
 			)
 
 		return rss_feed_list
 
-	def saveEntry_to_notion(self, entry, page_id, tags):
+	def saveEntry_to_notion(self, entry, page_id):
 		"""
 		Save entry lists into reading database
 
@@ -168,9 +209,6 @@ class NotionAPI:
 				"Published": {"date": {"start": entry.get("time")}},
 				"Source":{
 					"relation": [{"id": page_id}]
-				},
-				"Tag": {
-					"multi_select": [{"name": tag[0], "color": tag[1]} for tag in tags]
 				}
 			},
 			"children": [
@@ -187,13 +225,13 @@ class NotionAPI:
 				}
 			],
 		}
-		res = requests.post(url=self.NOTION_API_pages, headers=self.headers, json=payload)
+		response = requests.post(url=self.NOTION_API_pages, headers=self.headers, json=payload)
 
-
-		print(res.status_code)
-		return res
+		# DEBUG: print Notion API responce status
+		# print(response.status_code)
+		return response
 	
-	def saveFeed_to_notion(self, prop, page_id):
+	def updateFeedInfo_to_notion(self, prop, page_id):
 		"""
 		Update feed info into URL database
 
@@ -208,14 +246,6 @@ class NotionAPI:
 		payload = {
 			"parent": {"database_id": self.feeds_id},
 			"properties": {
-				"Feed Name": {
-					"title": [
-						{
-							"type": "text",
-							"text": {"content": prop.get("title")},
-						}
-					]
-				},
 				"Status":{
 					"select":{
 						"name": prop.get("status"),
@@ -226,9 +256,10 @@ class NotionAPI:
 			},
 		}
 
-		res = requests.patch(url=url, headers=self.headers, json=payload)
-		print(res.status_code)
-		return res
+		response = requests.patch(url=url, headers=self.headers, json=payload)
+		# DEBUG
+		# print(response.status_code)
+		return response
 
 	## Todo: figure out deleting process
 	# def delete_rss(self):
