@@ -81,7 +81,7 @@ def parse_rss_entries(url, retries=3):
 
 class NotionAPI:
 	NOTION_API_pages = "https://api.notion.com/v1/pages"
-	NOTION_API_database = "https://api.notion.com/v1/databases"
+	NOTION_API_database = "https://api.notion.com/v1/data_sources"
 
 
 	def __init__(self, secret, read, feed) -> None:
